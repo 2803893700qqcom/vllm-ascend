@@ -120,7 +120,7 @@ def test_deepseek_v4_mtp_full_decode_only():
 )
 @patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
 @wait_until_npu_memory_free(target_free_percentage=0.8)
-def test_dspark_spec_decoding(
+def test_dspark_topk_spec_decoding(
     model: str,
     max_tokens: int,
     enforce_eager: bool,
@@ -148,6 +148,8 @@ def test_dspark_spec_decoding(
             "method": "dspark",
             "num_speculative_tokens": num_speculative_tokens,
             **({"enable_adaptive_verification": True} if enable_adaptive_verification else {}),
+            "draft_sample_method": "greedy",
+            "dspark_draft_topk": 512,
         },
         compilation_config=compilation_config,
     ) as runner:

@@ -79,6 +79,99 @@ def test_deepseek_v4_vision_dspark_restores_draft_architecture():
     registry.inspect_model_cls.assert_called_once_with(["DSparkDraftModel"], draft_model_config)
 
 
+def _make_deepseek_v4_dspark_topk_config(
+    *,
+    topk: int = 512,
+    draft_sample_method: str = "greedy",
+):
+    target_hf_config = SimpleNamespace(model_type="deepseek_v4")
+    draft_hf_config = SimpleNamespace(
+        model_type="deepseek_v4",
+        architectures=["DSparkDraftModel"],
+        vocab_size=129280,
+        draft_vocab_size=None,
+        dspark_target_layer_ids=None,
+        ptd_token_id=128815,
+    )
+    return SimpleNamespace(
+        method="dspark",
+        dspark_draft_topk=topk,
+        draft_sample_method=draft_sample_method,
+        target_model_config=SimpleNamespace(hf_config=target_hf_config),
+        target_parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        draft_model_config=SimpleNamespace(
+            architectures=["DSparkDraftModel"],
+            hf_config=draft_hf_config,
+        ),
+        use_dspark=lambda: True,
+    )
+
+
+def test_deepseek_v4_dspark_topk_is_deferred_and_propagated(monkeypatch):
+    config = _make_deepseek_v4_dspark_topk_config()
+    monkeypatch.setattr(
+        patch_speculative_config.envs,
+        "VLLM_USE_V2_MODEL_RUNNER",
+        True,
+    )
+
+    def validate_without_topk(validated_config):
+        assert validated_config.dspark_draft_topk is None
+
+    monkeypatch.setattr(
+        patch_speculative_config,
+        "_orig_post_init",
+        validate_without_topk,
+    )
+
+    patch_speculative_config._dspark_post_init(config)
+
+    assert config.dspark_draft_topk == 512
+    assert config.draft_model_config.hf_config.dspark_draft_topk == 512
+
+
+@pytest.mark.parametrize("topk", [0, 129281])
+def test_deepseek_v4_dspark_topk_rejects_out_of_range(monkeypatch, topk):
+    config = _make_deepseek_v4_dspark_topk_config(topk=topk)
+    monkeypatch.setattr(
+        patch_speculative_config.envs,
+        "VLLM_USE_V2_MODEL_RUNNER",
+        True,
+    )
+    monkeypatch.setattr(patch_speculative_config, "_orig_post_init", lambda _: None)
+
+    with pytest.raises(ValueError, match="draft vocabulary size"):
+        patch_speculative_config._dspark_post_init(config)
+
+
+def test_deepseek_v4_dspark_topk_rejects_probabilistic_sampling(monkeypatch):
+    config = _make_deepseek_v4_dspark_topk_config(
+        draft_sample_method="probabilistic"
+    )
+    monkeypatch.setattr(
+        patch_speculative_config.envs,
+        "VLLM_USE_V2_MODEL_RUNNER",
+        True,
+    )
+    monkeypatch.setattr(patch_speculative_config, "_orig_post_init", lambda _: None)
+
+    with pytest.raises(ValueError, match="draft_sample_method='greedy'"):
+        patch_speculative_config._dspark_post_init(config)
+
+
+def test_deepseek_v4_dspark_topk_requires_model_runner_v2(monkeypatch):
+    config = _make_deepseek_v4_dspark_topk_config()
+    monkeypatch.setattr(
+        patch_speculative_config.envs,
+        "VLLM_USE_V2_MODEL_RUNNER",
+        False,
+    )
+    monkeypatch.setattr(patch_speculative_config, "_orig_post_init", lambda _: None)
+
+    with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER=1"):
+        patch_speculative_config._dspark_post_init(config)
+
+
 def _make_k3_dspark_config(
     dcp_size: int = 8,
     method: str = "dspark",

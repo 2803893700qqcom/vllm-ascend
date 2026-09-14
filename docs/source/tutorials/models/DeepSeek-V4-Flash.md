@@ -195,6 +195,7 @@ Single-node deployment completes both Prefill and Decode within the same node. T
     export HCCL_BUFFSIZE=1024
     export TASK_QUEUE_ENABLE=1
     export HCCL_OP_EXPANSION_MODE=AIV
+    export VLLM_USE_V2_MODEL_RUNNER=1
 
     vllm serve /root/.cache/modelscope/hub/models/UploadWeight/DeepSeek-V4-Flash-DSpark-w4a8-test \
         --max-model-len 800000 \
@@ -214,7 +215,7 @@ Single-node deployment completes both Prefill and Decode within the same node. T
         --quantization ascend \
         --port 8000 \
         --block-size 128 \
-        --speculative-config '{"method": "dspark", "num_speculative_tokens": 7, "enforce_eager": true}'  \
+        --speculative-config '{"method": "dspark", "num_speculative_tokens": 7, "draft_sample_method": "greedy", "dspark_draft_topk": 512, "enforce_eager": true}'  \
         --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
     ```
     tps more than 50+ ,its reach  2X speed of dsv4f with mtp
@@ -275,6 +276,7 @@ Single-node deployment completes both Prefill and Decode within the same node. T
     export TASK_QUEUE_ENABLE=1
     export HCCL_OP_EXPANSION_MODE="AIV"
     export VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096
+    export VLLM_USE_V2_MODEL_RUNNER=1
 
     vllm serve /path/to/DeepSeek-V4-Flash-0731-w8a8 \
         --max-model-len 1048576 \
@@ -293,7 +295,7 @@ Single-node deployment completes both Prefill and Decode within the same node. T
         --quantization ascend \
         --port 8900 \
         --block-size 32 \
-        --speculative-config '{"method":"dspark","num_speculative_tokens":7,"enforce_eager":true}' \
+        --speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"greedy","dspark_draft_topk":512,"enforce_eager":true}' \
         --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
         --additional-config '{
             "ascend_compilation_config": {
@@ -317,6 +319,7 @@ Key Parameter Descriptions:
 - `--block-size` sets the KV cache block size. To enable the experimental 4k prefix cache hit support, change it from `128` to `32`.
 - `--quantization ascend` enables Ascend quantization for the W8A8 model.
 - `--speculative-config` configures speculative decoding to accelerate inference. Use `mtp` for Multi-Token Prediction (MTP) and `dspark` for DSpark models. When using DSpark, `num_speculative_tokens` must be at least 5 (check the checkpoint's `config.json`).
+- `dspark_draft_topk` enables sparse Markov projection for DeepSeek-V4 DSpark. It selects the base-logit candidates before applying the Markov head, reducing projection work and tensor-parallel communication. This optimization currently requires Model Runner V2 (`VLLM_USE_V2_MODEL_RUNNER=1`) and `draft_sample_method` set to `greedy`; the examples use `512` as an initial test value. Omit the option to retain the dense baseline.
 - `--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'` enables full ACL graph execution in the decode phase to reduce scheduling latency.
 - `--additional-config` enables Ascend-specific optimizations. `enable_npugraph_ex` enables enhanced ACL graph execution, `enable_static_kernel: false` keeps static-kernel compilation disabled, `enable_cpu_binding` enables Ascend-native CPU binding, `enable_dsa_cp` enables DSA context parallelism, and `multistream_overlap_shared_expert` overlaps shared expert computation for better MoE throughput.
 - `VLLM_PREFIX_CACHE_RETENTION_INTERVAL`: Controls the retention interval, in tokens, for prefix-cache checkpoints of hybrid attention layers. It is applicable to DeepSeek-V4 and takes effect only when prefix caching is enabled. Under KV-cache pressure, it can improve the effective prefix-cache hit rate for reusable long prefixes. The value must be a non-negative multiple of `--block-size`; for DeepSeek-V4-Flash, 128 times `--block-size` is recommended. Set it to `4096` when `--block-size` is `32`, or `16384` when `--block-size` is `128`.
@@ -654,6 +657,7 @@ Before you start, please:
         export ASCEND_RT_VISIBLE_DEVICES=$1
         export VLLM_ASCEND_ENABLE_FUSED_MC2=1
         export VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096
+        export VLLM_USE_V2_MODEL_RUNNER=1
 
         vllm serve /path/to/DeepSeek-V4-Flash-0731-w8a8 \
             --host 0.0.0.0 \
@@ -671,7 +675,7 @@ Before you start, please:
             --max-num-seqs 16 \
             --no-disable-hybrid-kv-cache-manager \
             --model-loader-extra-config='{"enable_multithread_load": true, "num_threads": 128}' \
-            --speculative-config '{"num_speculative_tokens": 5,"method": "dspark","enforce_eager": true}' \
+            --speculative-config '{"num_speculative_tokens": 5,"method": "dspark","draft_sample_method": "greedy","dspark_draft_topk": 512,"enforce_eager": true}' \
             --trust-remote-code \
             --block-size 32 \
             --tokenizer-mode deepseek_v4 \
@@ -722,6 +726,7 @@ Before you start, please:
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
         export HCCL_BUFFSIZE=2400
         export ASCEND_RT_VISIBLE_DEVICES=$1
+        export VLLM_USE_V2_MODEL_RUNNER=1
 
         vllm serve /path/to/DeepSeek-V4-Flash-0731-w8a8 \
             --host 0.0.0.0 \
@@ -749,7 +754,7 @@ Before you start, please:
             --reasoning-parser deepseek_v4 \
             --gpu-memory-utilization 0.95 \
             --quantization ascend \
-            --speculative-config '{"num_speculative_tokens": 5,"method": "dspark","enforce_eager": true}' \
+            --speculative-config '{"num_speculative_tokens": 5,"method": "dspark","draft_sample_method": "greedy","dspark_draft_topk": 512,"enforce_eager": true}' \
             --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY","cudagraph_capture_sizes": [12, 24, 48, 96, 192, 256, 288, 360]}' \
             --kv-transfer-config \
             '{"kv_connector": "MooncakeHybridConnector",

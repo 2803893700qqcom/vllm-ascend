@@ -4,6 +4,7 @@ from dataclasses import replace
 from typing import Literal, get_args
 
 import vllm.config.speculative as speculative_config
+import vllm.envs as envs
 from transformers import DeepseekV2Config, PretrainedConfig
 from vllm.config.speculative import SpeculativeConfig
 
@@ -101,14 +102,72 @@ def _temporarily_disable_dspark_dcp(self: SpeculativeConfig):
         self.target_parallel_config = target_parallel_config
 
 
+@contextmanager
+def _defer_deepseek_v4_dspark_topk(self: SpeculativeConfig):
+    """Defer upstream's Qwen-only top-k validation for DeepSeek-V4."""
+    topk = getattr(self, "dspark_draft_topk", None)
+    target_config = getattr(self, "target_model_config", None)
+    target_hf_config = getattr(target_config, "hf_config", None)
+    is_deepseek_v4 = getattr(target_hf_config, "model_type", None) == "deepseek_v4"
+    if self.method != "dspark" or topk is None or not is_deepseek_v4:
+        yield None
+        return
+
+    self.dspark_draft_topk = None
+    try:
+        yield topk
+    finally:
+        self.dspark_draft_topk = topk
+
+
+def _apply_deepseek_v4_dspark_topk(
+    self: SpeculativeConfig,
+    topk: int | None,
+) -> None:
+    if topk is None:
+        return
+    draft_model_config = self.draft_model_config
+    hf_config = draft_model_config.hf_config
+    if (
+        getattr(hf_config, "model_type", None) != "deepseek_v4"
+        or "DSparkDraftModel" not in draft_model_config.architectures
+    ):
+        raise ValueError(
+            "Deferred dspark_draft_topk is only valid for DeepSeek-V4 DSpark"
+        )
+    vocab_size = getattr(hf_config, "draft_vocab_size", None) or hf_config.vocab_size
+    if not 1 <= topk <= vocab_size:
+        raise ValueError(
+            "dspark_draft_topk must be between 1 and the draft vocabulary "
+            f"size ({vocab_size})"
+        )
+    if getattr(self, "draft_sample_method", "greedy") != "greedy":
+        raise ValueError(
+            "DeepSeek-V4 DSpark top-k projection only supports "
+            "draft_sample_method='greedy'."
+        )
+    if envs.VLLM_USE_V2_MODEL_RUNNER is not True:
+        raise ValueError(
+            "DeepSeek-V4 DSpark top-k projection requires Model Runner V2. "
+            "Set VLLM_USE_V2_MODEL_RUNNER=1."
+        )
+    hf_config.dspark_draft_topk = topk
+
+
 def _dspark_post_init(self):
     # TODO: This block can be deleted after the upstream supports the overlay of mla dcp and dspark
-    with _temporarily_disable_dspark_dcp(self):
+    with (
+        _temporarily_disable_dspark_dcp(self),
+        _defer_deepseek_v4_dspark_topk(self) as deferred_topk,
+    ):
         _orig_post_init(self)
     if self.use_dspark():
         draft_model_config = getattr(self, "draft_model_config", None)
         draft_hf_config = getattr(draft_model_config, "hf_config", None)
         _normalize_deepseek_v4_dspark_draft(draft_model_config)
+        # Validate after architecture normalization. DeepSeek-V4-Vision may
+        # temporarily carry its target conditional-generation architecture.
+        _apply_deepseek_v4_dspark_topk(self, deferred_topk)
         # deepseek v4 dspark
         if getattr(draft_hf_config, "ptd_token_id", None) is None:  # type: ignore
             draft_hf_config.ptd_token_id = getattr(draft_hf_config, "dspark_noise_token_id", None)  # type: ignore

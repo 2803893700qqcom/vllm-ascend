@@ -590,6 +590,22 @@
 #       before DSpark draft selection, or otherwise guarantees that rebuilding
 #       `model_arch_config` preserves the selected draft architecture.
 #
+#   3. `vllm.config.speculative.SpeculativeConfig.__post_init__`
+#    Why:
+#       Upstream validates `dspark_draft_topk` against Qwen-specific draft
+#       architectures. DeepSeek-V4 uses `DSparkDraftModel`, so the otherwise
+#       valid sparse Markov projection configuration is rejected.
+#    How:
+#       Defer the upstream top-k architecture check for DeepSeek-V4, normalize
+#       the draft architecture, validate the vocabulary bound, Model Runner V2
+#       and greedy-only constraints, and propagate the value to the draft HF
+#       config.
+#    Related PR (if no, explain why):
+#       https://github.com/vllm-project/vllm/pull/54433
+#    Future Plan:
+#       Remove this compatibility patch once the supported vLLM revision
+#       accepts DeepSeek-V4 DSpark top-k projection natively.
+#
 # ** 19. File: platform/patch_structured_output.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.sampling_params.SamplingParams._validate_structured_outputs`
