@@ -41,9 +41,6 @@ class AscendDSparkSpeculator(DSparkSpeculator):
     _speculator_name = "DSpark"
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        vllm_config, self.replicated_pcp = prepare_replicated_pcp_config(
-            vllm_config
-        )
         super().__init__(vllm_config, device)
         self.input_batch: InputBatch | None = None
 
@@ -59,24 +56,15 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         if not self._enable_dspark_fused_greedy:
             return
 
+        if self._draft_topk is not None or self.draft_logits is not None:
+            # Reduced-vocabulary and probabilistic drafting keep the original path.
+            return
+
         hf_config = self.draft_model_config.hf_config
         if getattr(hf_config, "model_type", None) != "deepseek_v4":
             raise ValueError(
                 "enable_dspark_fused_greedy currently supports DeepSeek-V4 only"
             )
-
-        if (
-            self._draft_topk is not None
-            or additional_config.get("deepseek_v4_dspark_topk") is not None
-        ):
-            raise ValueError(
-                "Disable DSpark top-k before enabling full-vocabulary "
-                "fused greedy reduction"
-            )
-
-        if self.draft_logits is not None:
-            # Probabilistic drafting keeps the original implementation.
-            return
 
         vocab_size = max(
             hf_config.vocab_size,
