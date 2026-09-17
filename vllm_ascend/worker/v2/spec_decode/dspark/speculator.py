@@ -41,6 +41,7 @@ class AscendDSparkSpeculator(DSparkSpeculator):
     _speculator_name = "DSpark"
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+    
         super().__init__(vllm_config, device)
         self.input_batch: InputBatch | None = None
 
@@ -65,7 +66,7 @@ class AscendDSparkSpeculator(DSparkSpeculator):
             raise ValueError(
                 "enable_dspark_fused_greedy currently supports DeepSeek-V4 only"
             )
-
+        
         vocab_size = max(
             hf_config.vocab_size,
             getattr(hf_config, "draft_vocab_size", None) or 0,
@@ -93,8 +94,8 @@ class AscendDSparkSpeculator(DSparkSpeculator):
             or self.draft_logits is not None
             or self._draft_topk is not None
             or self.model.draft_id_to_target_id is not None
-            or self.use_acceptance_estimator
-            or self.draft_watermarker is not None
+            or getattr(self, "use_acceptance_estimator", False)
+            or getattr(self, "draft_watermarker", None) is not None
         ):
             super()._sample_sequential(num_reqs, head_hidden)
             return
@@ -113,12 +114,15 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
 
         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        use_confidence_head = getattr(
+            self, "use_confidence_head", self.enable_adaptive_verification
+        )
         confidence_markov_embeds = []
 
         for i in range(n_spec):
             markov_embed = self.model.markov_embed(prev)
 
-            if self.use_confidence_head:
+            if use_confidence_head:
                 confidence_markov_embeds.append(markov_embed)
 
             # Keep the original complete Markov projection.
@@ -157,7 +161,7 @@ class AscendDSparkSpeculator(DSparkSpeculator):
 
             prev = draft_sampled_i
 
-        if self.use_confidence_head:
+        if use_confidence_head:
             confidence = self.model.compute_confidence(
                 sample_hidden,
                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
