@@ -84,6 +84,7 @@ def get_cos_and_sin_dsa(
     positions: torch.Tensor | dict[str, torch.Tensor],
     use_cache: bool = False,
     draft_index: int | None = None,
+    cached_output_len: int | None = None,
 ):
     if isinstance(positions, torch.Tensor):
         pos_map = {"default": positions}
@@ -115,6 +116,9 @@ def get_cos_and_sin_dsa(
 
                 buf_cos, buf_sin = group_buffers
                 num_tokens = pos_tensor.size(0)
+                output_len = num_tokens if cached_output_len is None else cached_output_len
+                if output_len < num_tokens:
+                    raise ValueError("DSA RoPE output length is smaller than the input")
 
                 # This is semantically equivalent to the previous
                 # `full_rope_cos[pos_tensor] / full_rope_sin[pos_tensor]`
@@ -131,16 +135,25 @@ def get_cos_and_sin_dsa(
                     pos_tensor.to(torch.long).reshape(-1, 1, 1, 1).expand(num_tokens, 1, 1, full_rope_cos.size(-1))
                 )
                 if draft_index is None:
+                    if output_len > buf_cos.shape[0]:
+                        raise ValueError("DSA RoPE runtime buffer is too small")
                     torch.gather(full_rope_cos, 0, gather_idx, out=buf_cos[:num_tokens])
                     torch.gather(full_rope_sin, 0, gather_idx, out=buf_sin[:num_tokens])
-
-                    batch_result[config_key][group_name] = (buf_cos[:num_tokens], buf_sin[:num_tokens])
+                    buf_cos[num_tokens:output_len].fill_(1)
+                    buf_sin[num_tokens:output_len].zero_()
+                    batch_result[config_key][group_name] = (buf_cos[:output_len], buf_sin[:output_len])
                 else:
-                    torch.gather(full_rope_cos, 0, gather_idx, out=buf_cos[draft_index - 1][:num_tokens])
-                    torch.gather(full_rope_sin, 0, gather_idx, out=buf_sin[draft_index - 1][:num_tokens])
+                    draft_cos = buf_cos[draft_index - 1]
+                    draft_sin = buf_sin[draft_index - 1]
+                    if output_len > draft_cos.shape[0]:
+                        raise ValueError("DSA RoPE speculative buffer is too small")
+                    torch.gather(full_rope_cos, 0, gather_idx, out=draft_cos[:num_tokens])
+                    torch.gather(full_rope_sin, 0, gather_idx, out=draft_sin[:num_tokens])
+                    draft_cos[num_tokens:output_len].fill_(1)
+                    draft_sin[num_tokens:output_len].zero_()
                     batch_result[config_key][group_name] = (
-                        buf_cos[draft_index - 1][:num_tokens],
-                        buf_sin[draft_index - 1][:num_tokens],
+                        draft_cos[:output_len],
+                        draft_sin[:output_len],
                     )
             else:
                 curr_cos = full_rope_cos[pos_tensor]
@@ -222,12 +235,12 @@ class ComplexExpRotaryEmbedding(nn.Module):
 
             _ROPE_STATE.full_rope_cache[config_key] = (cos.unsqueeze(1).unsqueeze(1), sin.unsqueeze(1).unsqueeze(1))
 
-        use_eagle = (
+        use_draft = (
             vllm_config is not None
             and vllm_config.speculative_config is not None
-            and vllm_config.speculative_config.use_eagle()
+            and (vllm_config.speculative_config.use_eagle() or vllm_config.speculative_config.use_dspark())
         )
-        num_speculative_tokens = vllm_config.speculative_config.num_speculative_tokens if use_eagle else None
+        num_speculative_tokens = vllm_config.speculative_config.num_speculative_tokens if use_draft else None
 
         if config_key not in _ROPE_STATE.runtime_buffer:
             _ROPE_STATE.runtime_buffer[config_key] = {}
@@ -235,7 +248,12 @@ class ComplexExpRotaryEmbedding(nn.Module):
                 _ROPE_STATE.spec_runtime_buffer[config_key] = {}
 
         target_device = current_platform.device_type
-        max_batch_size = vllm_config.scheduler_config.max_num_batched_tokens
+        # DSA-CP partitions tokens evenly across TP ranks and may append
+        # up to TP-1 padding rows before taking a rank-local RoPE view.
+        max_batch_size = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+            + vllm_config.parallel_config.tensor_parallel_size - 1
+        )
         for grp in rope_groups:
             if grp not in _ROPE_STATE.runtime_buffer[config_key]:
                 buf_cos = torch.ones(max_batch_size, 1, 1, rotary_dim, dtype=torch.float32, device=target_device)
