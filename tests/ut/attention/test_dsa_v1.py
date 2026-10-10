@@ -346,14 +346,36 @@ def test_draft_swa_metadata_rejects_rows_above_buffer_capacity():
 
 
 @pytest.mark.parametrize(
-    ("compressor_ratio", "expected_stages"),
+    ("compressor_ratio", "seq_lens", "expected_fast_path", "expected_stages"),
     [
-        (4, [DeviceMetadataStage.COMPRESSOR, DeviceMetadataStage.INDEXER, DeviceMetadataStage.ATTENTION]),
-        (128, [DeviceMetadataStage.COMPRESSOR, DeviceMetadataStage.ATTENTION]),
+        (
+            4,
+            [8, 6],
+            True,
+            [DeviceMetadataStage.COMPRESSOR, DeviceMetadataStage.ATTENTION],
+        ),
+        (
+            4,
+            [2052, 2048],
+            False,
+            [
+                DeviceMetadataStage.COMPRESSOR,
+                DeviceMetadataStage.INDEXER,
+                DeviceMetadataStage.ATTENTION,
+            ],
+        ),
+        (
+            128,
+            [8, 6],
+            False,
+            [DeviceMetadataStage.COMPRESSOR, DeviceMetadataStage.ATTENTION],
+        ),
     ],
 )
 def test_build_req_metadata_defers_device_work_to_fixed_buffers(
     compressor_ratio: int,
+    seq_lens: list[int],
+    expected_fast_path: bool,
     expected_stages: list[DeviceMetadataStage],
 ):
     builder = _make_builder(compressor_ratio)
@@ -361,7 +383,7 @@ def test_build_req_metadata_defers_device_work_to_fixed_buffers(
     builder.enable_device_metadata()
     builder.num_actual_tokens = 3
     builder.num_prefills = 1
-    builder.seq_lens = torch.tensor([8, 6], dtype=torch.int32)
+    builder.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
     builder.block_table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
     builder.common_ratio_to_sas_metadata = {}
     query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
@@ -389,7 +411,10 @@ def test_build_req_metadata_defers_device_work_to_fixed_buffers(
         )
 
     assert req_metadata.sas_metadata is builder.sas_metadata_buffer
-    assert (req_metadata.qli_metadata is builder.qli_metadata_buffer) is (compressor_ratio == 4)
+    assert req_metadata.skip_indexer_scoring is expected_fast_path
+    assert (req_metadata.qli_metadata is builder.qli_metadata_buffer) is (
+        compressor_ratio == 4 and not expected_fast_path
+    )
     builder._build_sas_metadata.assert_not_called()
     builder._build_qli_metadata.assert_not_called()
 
@@ -410,10 +435,117 @@ def test_build_req_metadata_defers_device_work_to_fixed_buffers(
             task.run()
     build_compressor.assert_called_once()
     builder._build_sas_metadata.assert_called_once()
-    if compressor_ratio == 4:
+    if compressor_ratio == 4 and not expected_fast_path:
         builder._build_qli_metadata.assert_called_once()
     else:
         builder._build_qli_metadata.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    (
+        "graph_mode",
+        "full_graph_mode",
+        "num_prefills",
+        "num_decodes",
+        "max_seq_len",
+        "expected_fast_path",
+    ),
+    [
+        (CUDAGraphMode.NONE, False, 1, 0, 2048, True),
+        (CUDAGraphMode.NONE, False, 0, 2, 2048, True),
+        (CUDAGraphMode.NONE, False, 1, 0, 2052, False),
+        (CUDAGraphMode.FULL_DECODE_ONLY, False, 1, 0, 2048, True),
+        (CUDAGraphMode.FULL_DECODE_ONLY, False, 0, 2, 2048, False),
+        (CUDAGraphMode.FULL_DECODE_ONLY, False, 1, 1, 2048, False),
+        # PIECEWISE enters DSA through an eager graph break, so the fast path
+        # remains safe as long as this invocation is not a full graph replay.
+        (CUDAGraphMode.PIECEWISE, False, 1, 0, 2048, True),
+        (CUDAGraphMode.FULL, True, 1, 0, 2048, False),
+    ],
+)
+def test_short_context_fast_path_graph_and_length_gating(
+    graph_mode: CUDAGraphMode,
+    full_graph_mode: bool,
+    num_prefills: int,
+    num_decodes: int,
+    max_seq_len: int,
+    expected_fast_path: bool,
+):
+    builder = _make_builder(4)
+    builder.vllm_config.compilation_config.cudagraph_mode = graph_mode
+    builder.num_actual_tokens = 3
+    builder.num_prefills = num_prefills
+    builder.num_decodes = num_decodes
+    builder.seq_lens = torch.tensor([max_seq_len, 8], dtype=torch.int32)
+    builder.block_table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
+    positions = torch.tensor([0, 3, 7], dtype=torch.int64)
+    common_attn_metadata = SimpleNamespace(
+        num_reqs=2,
+        num_input_tokens=3,
+        positions=positions,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        causal=True,
+    )
+    builder._build_sas_metadata = MagicMock(return_value=torch.empty(0))
+    builder._build_qli_metadata = MagicMock(return_value=torch.empty(0))
+
+    with patch(
+        "vllm_ascend.attention.dsa_v1.get_full_cos_and_sin_dsa",
+        return_value=(torch.ones(1), torch.zeros(1)),
+    ):
+        req_metadata = builder.build_req_metadata(
+            common_attn_metadata=common_attn_metadata,
+            seq_lens_cpu=builder.seq_lens,
+            num_actual_reqs=None,
+            cos=torch.ones(3),
+            sin=torch.zeros(3),
+            full_graph_mode=full_graph_mode,
+        )
+
+    assert req_metadata.skip_indexer_scoring is expected_fast_path
+    assert req_metadata.short_context_topk_filled is False
+    assert req_metadata.positions is not None
+    assert torch.equal(req_metadata.positions, positions)
+    if expected_fast_path:
+        builder._build_qli_metadata.assert_not_called()
+        assert req_metadata.qli_metadata is None
+    else:
+        builder._build_qli_metadata.assert_called_once()
+
+
+def test_short_context_fast_path_requires_c4_compression():
+    builder = _make_builder(128)
+    builder.num_actual_tokens = 3
+    builder.num_prefills = 1
+    builder.num_decodes = 0
+    builder.seq_lens = torch.tensor([8, 6], dtype=torch.int32)
+    builder.block_table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
+    common_attn_metadata = SimpleNamespace(
+        num_reqs=2,
+        num_input_tokens=3,
+        positions=torch.arange(3),
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        causal=True,
+    )
+    builder._build_sas_metadata = MagicMock(return_value=torch.empty(0))
+
+    with patch(
+        "vllm_ascend.attention.dsa_v1.get_full_cos_and_sin_dsa",
+        return_value=(torch.ones(1), torch.zeros(1)),
+    ):
+        req_metadata = builder.build_req_metadata(
+            common_attn_metadata=common_attn_metadata,
+            seq_lens_cpu=builder.seq_lens,
+            num_actual_reqs=None,
+            cos=torch.ones(3),
+            sin=torch.zeros(3),
+        )
+
+    assert req_metadata.skip_indexer_scoring is False
 
 
 def test_full_graph_compressor_metadata_uses_capture_bucket_extent():

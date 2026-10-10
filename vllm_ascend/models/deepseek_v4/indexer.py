@@ -36,6 +36,7 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.models.deepseek_v4.attention import DeepseekV4IndexerCache
+from vllm.triton_utils import tl, triton
 from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import KVCacheSpec
@@ -53,7 +54,34 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.device_metadata import DeviceMetadataStage, wait_for_device_metadata
 
-
+@triton.jit
+def _fill_short_context_topk_indices(
+    output,
+    positions,
+    num_actual_tokens,
+    TOP_K: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    PADDED_TOP_K: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, PADDED_TOP_K)
+    valid_row = row < num_actual_tokens
+    position = tl.load(
+        positions + row,
+        mask=valid_row,
+        other=-1,
+    )
+    num_compressed = (position + 1) // COMPRESS_RATIO
+    values = tl.where(
+        valid_row & (offsets < num_compressed),
+        offsets,
+        -1,
+    )
+    tl.store(
+        output + row * TOP_K + offsets,
+        values,
+        mask=offsets < TOP_K,
+    )
 def hadamard_linear(x: torch.Tensor, hadamard: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...], int]:
     x_shape = x.shape
     dim = x.shape[-1]
@@ -340,6 +368,64 @@ class DeepseekV4Indexer(nn.Module):
         assert cache_req_metadata is not None
         assert hadamard is not None
         return cache_req_metadata, hadamard
+    def _run_short_context_cache_updates(
+        self,
+        hidden_states: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        metadata: AscendIndexerMetadata,
+        overlap_plan: IndexerOverlapPlan,
+        *,
+        write_cache: bool,
+    ) -> None:
+        """
+        Update both Indexer cache and Attention compressed-KV cache.
+
+        Indexer cache runs on the auxiliary stream.
+        Attention compressed-KV runs on the main stream.
+        """
+        if not write_cache:
+            return
+
+        aux_stream = overlap_plan.aux_stream
+        if aux_stream is None:
+            self.update_cache(
+                hidden_states,
+                kv_cache,
+                metadata,
+            )
+            compressed_kv, compress_slot_mapping = (
+                overlap_plan.compute_attention_compressed_kv()
+            )
+            overlap_plan.scatter_attention_compressed_kv(
+                compressed_kv,
+                compress_slot_mapping,
+            )
+            return
+        main_stream = torch.npu.current_stream()
+        inputs_ready = main_stream.record_event()
+        with npu_stream_switch(
+            aux_stream,
+            enabled=True,
+        ):
+            torch.npu.current_stream().wait_event(
+                inputs_ready
+            )
+            self.update_cache(
+                hidden_states,
+                kv_cache,
+                metadata,
+            )
+            indexer_cache_done = (
+                torch.npu.current_stream().record_event()
+            )
+        compressed_kv, compress_slot_mapping = (
+            overlap_plan.compute_attention_compressed_kv()
+        )
+        overlap_plan.scatter_attention_compressed_kv(
+            compressed_kv,
+            compress_slot_mapping,
+        )
+        main_stream.wait_event(indexer_cache_done)
 
     def update_cache(
         self,
@@ -415,8 +501,54 @@ class DeepseekV4Indexer(nn.Module):
         cos = cache_metadata.cos[layer_name][:num_tokens]
         sin = cache_metadata.sin[layer_name][:num_tokens]
         aux_stream = overlap_plan.aux_stream
+        short_context = (
+        cache_metadata.skip_indexer_scoring
+        )
+        attention_cache_updated = False
         if self.skip_topk:
             topk_indices = self._get_cached_topk_indices(num_tokens)
+        elif short_context:
+            if self.topk_indices_buffer is None:
+                raise RuntimeError(
+                    "topk_indices_buffer is required by "
+                    "the short-context Indexer fast path"
+                )
+
+            if cache_metadata.positions is None:
+                raise RuntimeError(
+                    "positions are required by "
+                    "the short-context Indexer fast path"
+                )
+            if not cache_metadata.short_context_topk_filled:
+                if num_tokens > 0:
+                    _fill_short_context_topk_indices[
+                        (num_tokens,)
+                    ](
+                        self.topk_indices_buffer,
+                        cache_metadata.positions,
+                        TOP_K=self.index_topk,
+                        COMPRESS_RATIO=self.compress_ratio,
+                        PADDED_TOP_K=(
+                            triton.next_power_of_2(
+                                self.index_topk
+                            )
+                        ),
+                        num_warps=8,
+                    )
+
+                cache_metadata.short_context_topk_filled = True
+
+            topk_indices = (
+                self._get_cached_topk_indices(num_tokens)
+            )
+            self._run_short_context_cache_updates(
+                hidden_states,
+                kv_cache,
+                metadata,
+                overlap_plan,
+                write_cache=write_cache,
+            )
+            attention_cache_updated = write_cache
         elif aux_stream is not None:
             indexer_q = self._cv_compute_query_and_update_cache_multistream(
                 hidden_states,
@@ -452,7 +584,7 @@ class DeepseekV4Indexer(nn.Module):
                 write_cache=write_cache,
             )
 
-        if write_cache and (self.skip_topk or aux_stream is None):
+        if write_cache and not attention_cache_updatedand (self.skip_topk or aux_stream is None):
             compressed_kv, compress_slot_mapping = overlap_plan.compute_attention_compressed_kv()
             overlap_plan.scatter_attention_compressed_kv(compressed_kv, compress_slot_mapping)
 

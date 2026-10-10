@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -15,6 +16,7 @@ from vllm_ascend.models.deepseek_v4.indexer import (
     AscendIndexerOps,
     DeepseekV4Indexer,
     IndexerOverlapPlan,
+    _fill_short_context_topk_indices,
     hadamard_linear,
     hadamard_scale,
     rotate_activation,
@@ -102,10 +104,24 @@ class TestIndexerTopKCache:
             indexer._update_cached_topk_indices(topk_indices)
 
 
-def _make_forward_metadata() -> tuple[AscendIndexerMetadata, torch.Tensor, torch.Tensor]:
-    cos = torch.arange(4).view(2, 1, 1, 2)
+def _make_forward_metadata(
+    *,
+    skip_indexer_scoring: bool = False,
+    short_context_topk_filled: bool = False,
+    positions: torch.Tensor | None = None,
+    num_tokens: int = 2,
+) -> tuple[AscendIndexerMetadata, torch.Tensor, torch.Tensor]:
+    cos = torch.arange(num_tokens * 2).view(num_tokens, 1, 1, 2)
     sin = -cos
-    request_metadata = SimpleNamespace(cos={"layer": cos}, sin={"layer": sin})
+    if positions is None:
+        positions = torch.arange(num_tokens)
+    request_metadata = SimpleNamespace(
+        cos={"layer": cos},
+        sin={"layer": sin},
+        positions=positions,
+        skip_indexer_scoring=skip_indexer_scoring,
+        short_context_topk_filled=short_context_topk_filled,
+    )
     metadata = AscendIndexerMetadata(
         compressor=AscendCompressorMetadata(
             cache=SimpleNamespace(
@@ -299,6 +315,341 @@ class TestIndexerForward:
         assert scatter.call_args.args[0] is compressed_kv
         assert scatter.call_args.args[1] is slot_mapping
 
+    def test_short_context_serial_updates_each_cache_once(self):
+        indexer = _make_indexer(torch.full((2, 3), -1, dtype=torch.int32))
+        indexer.skip_topk = False
+        indexer.use_index_cache = False
+        indexer.update_cache = MagicMock()
+        indexer._select_topk_serial = MagicMock()
+        indexer._cv_compute_query_and_update_cache_multistream = MagicMock()
+        indexer._select_topk_multistream = MagicMock()
+        metadata, _, _ = _make_forward_metadata(
+            skip_indexer_scoring=True,
+            short_context_topk_filled=True,
+            positions=torch.tensor([3, 7]),
+        )
+        compressed_kv = torch.ones((2, 1, 4))
+        slot_mapping = torch.zeros((2, 2), dtype=torch.int32)
+        compute = MagicMock(return_value=(compressed_kv, slot_mapping))
+        scatter = MagicMock()
+
+        actual = indexer(
+            layer_name="layer",
+            hidden_states=torch.ones((2, 4)),
+            qr=torch.ones((2, 4)),
+            kv_cache=(torch.empty(0),),
+            metadata=metadata,
+            overlap_plan=IndexerOverlapPlan(
+                compute_attention_compressed_kv=compute,
+                scatter_attention_compressed_kv=scatter,
+                aux_stream=None,
+            ),
+        )
+
+        assert actual.shape == (2, 1, 3)
+        indexer.update_cache.assert_called_once()
+        indexer._select_topk_serial.assert_not_called()
+        indexer._cv_compute_query_and_update_cache_multistream.assert_not_called()
+        indexer._select_topk_multistream.assert_not_called()
+        compute.assert_called_once_with()
+        scatter.assert_called_once_with(compressed_kv, slot_mapping)
+
+    def test_short_context_write_cache_false_skips_both_cache_updates(self):
+        indexer = _make_indexer(torch.full((2, 3), -1, dtype=torch.int32))
+        indexer.skip_topk = False
+        indexer.use_index_cache = False
+        indexer.update_cache = MagicMock()
+        metadata, _, _ = _make_forward_metadata(
+            skip_indexer_scoring=True,
+            short_context_topk_filled=True,
+        )
+        compute = MagicMock()
+        scatter = MagicMock()
+
+        actual = indexer(
+            layer_name="layer",
+            hidden_states=torch.ones((2, 4)),
+            qr=torch.ones((2, 4)),
+            kv_cache=(torch.empty(0),),
+            metadata=metadata,
+            overlap_plan=IndexerOverlapPlan(
+                compute_attention_compressed_kv=compute,
+                scatter_attention_compressed_kv=scatter,
+                aux_stream=None,
+            ),
+            write_cache=False,
+        )
+
+        assert actual.shape == (2, 1, 3)
+        indexer.update_cache.assert_not_called()
+        compute.assert_not_called()
+        scatter.assert_not_called()
+
+    def test_short_context_multistream_routes_through_overlap_helper(self):
+        indexer = _make_indexer(torch.full((2, 3), -1, dtype=torch.int32))
+        indexer.skip_topk = False
+        indexer.use_index_cache = False
+        indexer._run_short_context_cache_updates = MagicMock()
+        indexer._select_topk_serial = MagicMock()
+        indexer._cv_compute_query_and_update_cache_multistream = MagicMock()
+        indexer._select_topk_multistream = MagicMock()
+        metadata, _, _ = _make_forward_metadata(
+            skip_indexer_scoring=True,
+            short_context_topk_filled=True,
+        )
+        compute = MagicMock()
+        scatter = MagicMock()
+        aux_stream = object()
+        overlap_plan = IndexerOverlapPlan(
+            compute_attention_compressed_kv=compute,
+            scatter_attention_compressed_kv=scatter,
+            aux_stream=aux_stream,
+        )
+        hidden_states = torch.ones((2, 4))
+        kv_cache = (torch.empty(0),)
+
+        indexer(
+            layer_name="layer",
+            hidden_states=hidden_states,
+            qr=torch.ones((2, 4)),
+            kv_cache=kv_cache,
+            metadata=metadata,
+            overlap_plan=overlap_plan,
+        )
+
+        indexer._run_short_context_cache_updates.assert_called_once_with(
+            hidden_states,
+            kv_cache,
+            metadata,
+            overlap_plan,
+            write_cache=True,
+        )
+        indexer._select_topk_serial.assert_not_called()
+        indexer._cv_compute_query_and_update_cache_multistream.assert_not_called()
+        indexer._select_topk_multistream.assert_not_called()
+        compute.assert_not_called()
+        scatter.assert_not_called()
+
+    def test_short_context_fills_shared_topk_buffer_once(self):
+        indexer = _make_indexer(torch.full((2, 3), -1, dtype=torch.int32))
+        indexer.skip_topk = False
+        indexer.use_index_cache = False
+        indexer.index_topk = 3
+        indexer.compress_ratio = 4
+        metadata, _, _ = _make_forward_metadata(
+            skip_indexer_scoring=True,
+            positions=torch.tensor([3, 7]),
+        )
+        compute = MagicMock()
+        scatter = MagicMock()
+
+        with patch("vllm_ascend.models.deepseek_v4.indexer._fill_short_context_topk_indices") as fill_kernel:
+            launcher = fill_kernel.__getitem__.return_value
+            for _ in range(2):
+                indexer(
+                    layer_name="layer",
+                    hidden_states=torch.ones((2, 4)),
+                    qr=torch.ones((2, 4)),
+                    kv_cache=(torch.empty(0),),
+                    metadata=metadata,
+                    overlap_plan=IndexerOverlapPlan(
+                        compute_attention_compressed_kv=compute,
+                        scatter_attention_compressed_kv=scatter,
+                        aux_stream=None,
+                    ),
+                    write_cache=False,
+                )
+
+        fill_kernel.__getitem__.assert_called_once_with((2,))
+        launcher.assert_called_once()
+        assert metadata.compressor.cache.req_metadata.short_context_topk_filled
+        compute.assert_not_called()
+        scatter.assert_not_called()
+
+    def test_short_context_fill_receives_actual_token_count_for_padded_batch(self):
+        indexer = _make_indexer(torch.full((4, 3), 99, dtype=torch.int32))
+        indexer.skip_topk = False
+        indexer.use_index_cache = False
+        indexer.index_topk = 3
+        indexer.compress_ratio = 4
+        positions = torch.tensor([3, 7])
+        metadata, _, _ = _make_forward_metadata(
+            skip_indexer_scoring=True,
+            positions=positions,
+            num_tokens=4,
+        )
+
+        with patch("vllm_ascend.models.deepseek_v4.indexer._fill_short_context_topk_indices") as fill_kernel:
+            launcher = fill_kernel.__getitem__.return_value
+            indexer(
+                layer_name="layer",
+                hidden_states=torch.ones((4, 4)),
+                qr=torch.ones((4, 4)),
+                kv_cache=(torch.empty(0),),
+                metadata=metadata,
+                overlap_plan=IndexerOverlapPlan(
+                    compute_attention_compressed_kv=MagicMock(),
+                    scatter_attention_compressed_kv=MagicMock(),
+                    aux_stream=None,
+                ),
+                write_cache=False,
+            )
+
+        fill_kernel.__getitem__.assert_called_once_with((4,))
+        assert launcher.call_args.args[0] is indexer.topk_indices_buffer
+        assert launcher.call_args.args[1] is positions
+        assert launcher.call_args.args[2] == 2
+
+    @pytest.mark.parametrize(
+        ("topk_indices_buffer", "positions", "expected_error"),
+        [
+            (None, torch.tensor([3, 7]), "topk_indices_buffer is required"),
+            (torch.full((2, 3), -1, dtype=torch.int32), None, "positions are required"),
+        ],
+    )
+    def test_short_context_requires_buffer_and_positions(
+        self,
+        topk_indices_buffer: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        expected_error: str,
+    ):
+        indexer = _make_indexer(topk_indices_buffer)
+        indexer.skip_topk = False
+        indexer.use_index_cache = False
+        metadata, _, _ = _make_forward_metadata(
+            skip_indexer_scoring=True,
+            positions=positions,
+        )
+        if positions is None:
+            metadata.compressor.cache.req_metadata.positions = None
+
+        with pytest.raises(RuntimeError, match=expected_error):
+            indexer(
+                layer_name="layer",
+                hidden_states=torch.ones((2, 4)),
+                qr=torch.ones((2, 4)),
+                kv_cache=(torch.empty(0),),
+                metadata=metadata,
+                overlap_plan=IndexerOverlapPlan(
+                    compute_attention_compressed_kv=MagicMock(),
+                    scatter_attention_compressed_kv=MagicMock(),
+                    aux_stream=None,
+                ),
+                write_cache=False,
+            )
+
+    def test_static_skip_topk_takes_precedence_over_short_context_fill(self):
+        topk_indices_buffer = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+        indexer = _make_indexer(topk_indices_buffer)
+        indexer.skip_topk = True
+        indexer.use_index_cache = False
+        metadata, _, _ = _make_forward_metadata(skip_indexer_scoring=True)
+
+        with (
+            patch("vllm_ascend.models.deepseek_v4.indexer._fill_short_context_topk_indices") as fill_kernel,
+            patch.object(indexer, "_run_short_context_cache_updates") as update_caches,
+        ):
+            actual = indexer(
+                layer_name="layer",
+                hidden_states=torch.ones((2, 4)),
+                qr=torch.ones((2, 4)),
+                kv_cache=(torch.empty(0),),
+                metadata=metadata,
+                overlap_plan=IndexerOverlapPlan(
+                    compute_attention_compressed_kv=MagicMock(),
+                    scatter_attention_compressed_kv=MagicMock(),
+                    aux_stream=None,
+                ),
+                write_cache=False,
+            )
+
+        assert torch.equal(actual, topk_indices_buffer.unsqueeze(1))
+        fill_kernel.__getitem__.assert_not_called()
+        update_caches.assert_not_called()
+
+
+class TestIndexerForwardCacheOverlap:
+    def test_multistream_orders_dependencies_and_updates_each_cache_once(self):
+        indexer = _make_indexer(torch.full((2, 3), -1, dtype=torch.int32))
+        metadata, _, _ = _make_forward_metadata(skip_indexer_scoring=True)
+        execution_order: list[str] = []
+        inputs_ready = object()
+        indexer_cache_done = object()
+        main_stream = MagicMock()
+        aux_stream = MagicMock()
+        main_stream.record_event.side_effect = lambda: (execution_order.append("record_inputs_ready") or inputs_ready)
+        main_stream.wait_event.side_effect = lambda event: (execution_order.append("wait_indexer_cache_done"))
+        aux_stream.wait_event.side_effect = lambda event: (execution_order.append("wait_inputs_ready"))
+        aux_stream.record_event.side_effect = lambda: (
+            execution_order.append("record_indexer_cache_done") or indexer_cache_done
+        )
+        indexer.update_cache = MagicMock(side_effect=lambda *args: execution_order.append("update_indexer_cache"))
+        compressed_kv = torch.ones((2, 1, 4))
+        slot_mapping = torch.zeros((2, 2), dtype=torch.int32)
+        compute = MagicMock(
+            side_effect=lambda: (execution_order.append("compute_attention_cache") or (compressed_kv, slot_mapping))
+        )
+        scatter = MagicMock(side_effect=lambda *args: execution_order.append("scatter_attention_cache"))
+        overlap_plan = IndexerOverlapPlan(
+            compute_attention_compressed_kv=compute,
+            scatter_attention_compressed_kv=scatter,
+            aux_stream=aux_stream,
+        )
+
+        fake_npu = SimpleNamespace(current_stream=MagicMock(side_effect=[main_stream, aux_stream, aux_stream]))
+        with (
+            patch.object(torch, "npu", fake_npu, create=True),
+            patch(
+                "vllm_ascend.models.deepseek_v4.indexer.npu_stream_switch",
+                return_value=nullcontext(),
+            ),
+        ):
+            indexer._run_short_context_cache_updates(
+                torch.ones((2, 4)),
+                (torch.empty(0),),
+                metadata,
+                overlap_plan,
+                write_cache=True,
+            )
+
+        assert execution_order == [
+            "record_inputs_ready",
+            "wait_inputs_ready",
+            "update_indexer_cache",
+            "record_indexer_cache_done",
+            "compute_attention_cache",
+            "scatter_attention_cache",
+            "wait_indexer_cache_done",
+        ]
+        aux_stream.wait_event.assert_called_once_with(inputs_ready)
+        main_stream.wait_event.assert_called_once_with(indexer_cache_done)
+        indexer.update_cache.assert_called_once()
+        compute.assert_called_once_with()
+        scatter.assert_called_once_with(compressed_kv, slot_mapping)
+
+    def test_multistream_write_cache_false_does_no_work(self):
+        indexer = _make_indexer(torch.full((2, 3), -1, dtype=torch.int32))
+        indexer.update_cache = MagicMock()
+        metadata, _, _ = _make_forward_metadata(skip_indexer_scoring=True)
+        compute = MagicMock()
+        scatter = MagicMock()
+
+        indexer._run_short_context_cache_updates(
+            torch.ones((2, 4)),
+            (torch.empty(0),),
+            metadata,
+            IndexerOverlapPlan(
+                compute_attention_compressed_kv=compute,
+                scatter_attention_compressed_kv=scatter,
+                aux_stream=MagicMock(),
+            ),
+            write_cache=False,
+        )
+
+        indexer.update_cache.assert_not_called()
+        compute.assert_not_called()
+        scatter.assert_not_called()
+
     def test_serial_prepared_cache_selects_topk_without_cache_writes(self):
         indexer = _make_indexer(None)
         indexer.skip_topk = False
@@ -366,6 +717,57 @@ class TestIndexerForward:
         assert select_args[5] is metadata.compressor.cache.req_metadata
         compute.assert_not_called()
         scatter.assert_not_called()
+
+
+@pytest.mark.skipif(
+    not getattr(getattr(torch, "npu", None), "is_available", lambda: False)(),
+    reason="requires an available NPU to execute the Triton kernel",
+)
+@pytest.mark.parametrize(
+    ("positions", "num_rows", "expected"),
+    [
+        (
+            [0, 3, 7, 11],
+            4,
+            [
+                [-1, -1, -1, -1],
+                [0, -1, -1, -1],
+                [0, 1, -1, -1],
+                [0, 1, 2, -1],
+            ],
+        ),
+        (
+            [3, 7],
+            4,
+            [
+                [0, -1, -1, -1],
+                [0, 1, -1, -1],
+                [-1, -1, -1, -1],
+                [-1, -1, -1, -1],
+            ],
+        ),
+    ],
+)
+def test_fill_short_context_topk_indices_masks_padding(
+    positions: list[int],
+    num_rows: int,
+    expected: list[list[int]],
+):
+    positions_npu = torch.tensor(positions, dtype=torch.int64, device="npu")
+    output = torch.full((num_rows, 4), 99, dtype=torch.int32, device="npu")
+
+    _fill_short_context_topk_indices[(num_rows,)](
+        output,
+        positions_npu,
+        len(positions),
+        TOP_K=4,
+        COMPRESS_RATIO=4,
+        PADDED_TOP_K=4,
+        num_warps=8,
+    )
+    torch.npu.synchronize()
+
+    assert output.cpu().tolist() == expected
 
 
 class TestIndexerOps:

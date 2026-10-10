@@ -365,6 +365,9 @@ class AscendDSAReqMetadata:
     ori_win_right: int | None = None
     dspark_swa_indices: torch.Tensor | None = None
     vision_swa_indices: torch.Tensor | None = None
+    positions: torch.Tensor | None = None
+    skip_indexer_scoring: bool = False
+    short_context_topk_filled: bool = False
 
 
 @dataclass
@@ -1101,6 +1104,28 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             metadata_cache["req_preamble"] = preamble
         max_seqlen_q, max_seqlen_kv, start_pos = preamble
         has_prefill = self.num_prefills > 0
+        pure_prefill = has_prefill and self.num_decodes == 0
+        graph_mode = (
+            self.vllm_config
+            .compilation_config
+            .cudagraph_mode
+        )
+        safe_eager_step = (
+            graph_mode == CUDAGraphMode.NONE
+            or (
+                graph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+                and pure_prefill
+            )
+        )
+        skip_indexer_scoring = (
+            self.compressor_ratio == 4
+            and safe_eager_step
+            and not full_graph_mode
+            and (
+                max_seqlen_kv // self.compressor_ratio
+                <= self.model_config.hf_config.index_topk
+            )
+        )
 
         # start_pos_prefill is a per-builder buffer with a capture-stable
         # address, so the shared start_pos is copied in rather than aliased.
@@ -1207,7 +1232,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     max_seqlen_kv=max_seqlen_kv,
                 )
 
-            if self.compressor_ratio == 4:
+            if self.compressor_ratio == 4 and not skip_indexer_scoring:
                 self._device_metadata_tasks = (
                     DeviceMetadataTask(DeviceMetadataStage.INDEXER, build_qli_metadata, id(self.qli_metadata_buffer)),
                     DeviceMetadataTask(DeviceMetadataStage.ATTENTION, build_sas_metadata, id(self.sas_metadata_buffer)),
@@ -1217,7 +1242,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     DeviceMetadataTask(DeviceMetadataStage.ATTENTION, build_sas_metadata, id(self.sas_metadata_buffer)),
                 )
             sas_metadata = self.sas_metadata_buffer
-            qli_metadata = self.qli_metadata_buffer if self.compressor_ratio == 4 else None
+            qli_metadata = self.qli_metadata_buffer if self.compressor_ratio == 4 and not skip_indexer_scoring else None
         else:
             self._device_metadata_tasks = ()
             sas_metadata = self._build_sas_metadata(
@@ -1233,17 +1258,19 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 ori_win_right=ori_win_right,
                 dspark_swa=dspark_swa_indices is not None,
             )
-            qli_metadata = (
-                self._build_qli_metadata(
-                    metadata_cache=metadata_cache,
-                    query_start_loc=query_start_loc,
-                    seq_lens=seq_lens,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_kv=max_seqlen_kv,
+            qli_metadata = None
+            if not skip_indexer_scoring:
+                qli_metadata = (
+                    self._build_qli_metadata(
+                        metadata_cache=metadata_cache,
+                        query_start_loc=query_start_loc,
+                        seq_lens=seq_lens,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_kv=max_seqlen_kv,
+                    )
+                    if self.compressor_ratio == 4
+                    else None
                 )
-                if self.compressor_ratio == 4
-                else None
-            )
 
         full_compress_cos, full_compress_sin = None, None
         if self.compressor_ratio > 1:
@@ -1295,6 +1322,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             ori_win_right=ori_win_right,
             dspark_swa_indices=dspark_swa_indices,
             vision_swa_indices=vision_swa_indices,
+            # Fast-path metadata
+            positions=common_attn_metadata.positions[
+                : self.num_actual_tokens
+            ],
+            skip_indexer_scoring=skip_indexer_scoring,
+            short_context_topk_filled=False,
         )
         if self._device_metadata_enabled and self.compressor_metadata_buffers is not None:
             assert num_compressed_tokens is not None
