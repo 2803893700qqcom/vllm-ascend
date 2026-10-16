@@ -270,10 +270,10 @@ def test_capture_delegates_and_restores_contexts(monkeypatch, architecture, fail
         object(),
         128,
     )
-    args = (*forward_args, False, "capture")
+    prepare_forward = MagicMock()
     expected_kwargs = {
         "causal": False,
-        "precompute_context_kv": "capture",
+        "prepare_forward": prepare_forward,
         "progress_bar_desc": "Capturing CUDA graphs",
     }
 
@@ -289,7 +289,11 @@ def test_capture_delegates_and_restores_contexts(monkeypatch, architecture, fail
 
     monkeypatch.setattr(graph.DFlashCudaGraphManager, "capture", capture)
     with pytest.raises(RuntimeError, match="capture failed") if fail else nullcontext():
-        manager.capture(*args)
+        # Match DFlashSpeculator.capture(): this keyword call is the interface
+        # contract that regressed when upstream renamed precompute_context_kv.
+        manager.capture(
+            *forward_args, causal=False, prepare_forward=prepare_forward
+        )
     assert events == ["enter communicator", "enter model", "capture", "exit model", "exit communicator"]
 
 
